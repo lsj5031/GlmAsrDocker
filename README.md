@@ -24,7 +24,7 @@ Inspired by the architecture of [faster-whisper-server](https://github.com/fedir
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/glm-asr.git
+git clone https://github.com/lsj5031/glm-asr-docker.git
 cd glm-asr
 ```
 
@@ -48,10 +48,20 @@ The API will be available at `http://localhost:8000`
 
 ### Docker Setup
 
+#### Using Pre-built Image
+
+Pull the latest image from GitHub Container Registry:
+```bash
+docker pull ghcr.io/lsj5031/glm-asr-docker:latest
+docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface ghcr.io/lsj5031/glm-asr-docker:latest
+```
+
+#### Build Locally
+
 Build and run with Docker:
 ```bash
 docker build -t glm-asr .
-docker run --gpus all -p 8000:8000 glm-asr
+docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface glm-asr
 ```
 
 ## Usage
@@ -114,6 +124,8 @@ MIT License - See LICENSE file for details
 ## Contributing
 
 Contributions are welcome. Please feel free to submit a pull request.
+
+We especially welcome enhancements to the Dockerfile to make it smaller and more modern. If you have ideas for optimizing the Docker image (multi-stage builds, better layer caching, Alpine Linux compatibility, etc.), we'd love to see your contributions.
 
 ## Citation
 
