@@ -172,7 +172,9 @@ async def transcribe(
         transcript_ids = generated[0, prompt_len:].cpu().tolist()
         transcript = tokenizer.decode(transcript_ids, skip_special_tokens=True).strip()
         
-        return transcript or "[Empty transcription]"
+        return JSONResponse({
+            "text": transcript or "[Empty transcription]"
+        })
     finally:
         os.unlink(audio_path)
 
