@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.1.0] - 2025-12-26
+
+### Added
+- Native implementation of `GlmAsrForConditionalGeneration` replacing generic AutoModel
+- `AutoProcessor` integration for correct feature extraction
+- `MAX_NEW_TOKENS` environment variable to control generation length
+- `soundfile` and `numpy` based audio processing pipeline
+- `libsndfile1` system dependency in Dockerfile
+
+### Changed
+- Refactored audio processing to be simpler and more robust
+- Updated dependencies to use latest transformers from source
+- Improved audio resampling logic
+- Replaced `torchaudio` loading with `soundfile` for better compatibility
+
+### Removed
+- `WhisperFeatureExtractor` dependency (incorrect for GLM-ASR)
+- Complex custom audio token length calculation logic
+- Generic `AutoModelForCausalLM` usage
+
+### Infrastructure
+
 ### Added
 - Multi-stage Docker build for smaller image size
 - PyTorch base image (2.8.0-cuda12.8-cudnn9-runtime)

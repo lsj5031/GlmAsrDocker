@@ -20,6 +20,7 @@ Inspired by the architecture of [faster-whisper-server](https://github.com/fedir
 - Python 3.10+
 - CUDA 12.8 (optional, for GPU acceleration)
 - FFmpeg
+- libsndfile (for audio processing)
 - Docker & Docker Compose (for containerized setup)
 
 ## Installation
@@ -82,16 +83,16 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. (Optional) Install FFmpeg:
+4. (Optional) Install FFmpeg and libsndfile:
 ```bash
 # Ubuntu/Debian
-sudo apt-get install ffmpeg
+sudo apt-get install ffmpeg libsndfile1
 
 # macOS
-brew install ffmpeg
+brew install ffmpeg libsndfile
 
 # Windows (with conda)
-conda install ffmpeg
+conda install ffmpeg libsndfile
 ```
 
 5. Run the server:
@@ -143,6 +144,9 @@ MODEL_ID=zai-org/GLM-ASR-Nano-2512
 
 # Enable JSON logging (default: false)
 JSON_LOGGING=false
+
+# Max new tokens for generation (default: 500)
+MAX_NEW_TOKENS=500
 ```
 
 ### Setting Environment Variables
