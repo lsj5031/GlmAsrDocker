@@ -7,20 +7,17 @@ import signal
 import sys
 import tempfile
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import ffmpeg
+import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from pydub import AudioSegment
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    WhisperFeatureExtractor,
-)
+from transformers import AutoProcessor, GlmAsrForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 
@@ -36,40 +33,25 @@ class ModelState:
 
     def __init__(self) -> None:
         """Initialize model state with None values."""
-        self.model: Optional[AutoModelForCausalLM] = None
-        self.tokenizer: Optional[AutoTokenizer] = None
-        self.feature_extractor: Optional[WhisperFeatureExtractor] = None
-        self.config: Optional[AutoConfig] = None
+        self.model: Optional[GlmAsrForConditionalGeneration] = None
+        self.processor: Optional[AutoProcessor] = None
         self.device: Optional[torch.device] = None
 
 
 model_state = ModelState()
-
-WHISPER_FEAT_CFG = {
-    "chunk_length": 30,
-    "feature_extractor_type": "WhisperFeatureExtractor",
-    "feature_size": 128,
-    "hop_length": 160,
-    "n_fft": 400,
-    "n_samples": 480000,
-    "nb_max_frames": 3000,
-    "padding_side": "right",
-    "padding_value": 0.0,
-    "processor_class": "WhisperProcessor",
-    "return_attention_mask": False,
-    "sampling_rate": 16000,
-}
 
 MODEL_ID = os.getenv("MODEL_ID", "zai-org/GLM-ASR-Nano-2512")
 PORT = int(os.getenv("PORT", "8000"))
 CHUNK_DURATION_MS = 30 * 1000  # 30 second chunks
 CHUNK_OVERLAP_MS = 2 * 1000  # 2 second overlap
 JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "500"))
 
 
 def setup_logging() -> None:
     """Configure logging with optional JSON format."""
     if JSON_LOGGING:
+
         class JSONFormatter(logging.Formatter):
             def format(self, record: logging.LogRecord) -> str:
                 log_data = {
@@ -95,7 +77,7 @@ def setup_logging() -> None:
         )
 
 
-def handle_sigterm(signum, frame):
+def handle_sigterm(signum: int, frame: Any) -> None:
     """Handle SIGTERM signal for graceful shutdown."""
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     sys.exit(0)
@@ -104,26 +86,24 @@ def handle_sigterm(signum, frame):
 async def load_model_fn() -> None:
     """Load model and components on startup."""
     signal.signal(signal.SIGTERM, handle_sigterm)
-    
+
     model_state.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_state.config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    model_state.model = AutoModelForCausalLM.from_pretrained(
+    logger.info(f"Loading processor from {MODEL_ID}...")
+    model_state.processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+    logger.info(f"Loading model from {MODEL_ID}...")
+    model_state.model = GlmAsrForConditionalGeneration.from_pretrained(
         MODEL_ID,
-        config=model_state.config,
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(model_state.device)
-    model_state.tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID, trust_remote_code=True
+        device_map="auto",
     )
-    model_state.feature_extractor = WhisperFeatureExtractor(**WHISPER_FEAT_CFG)
     model_state.model.eval()
     logger.info(f"Model loaded on device: {model_state.device}")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> None:
+async def lifespan(app: FastAPI):
     """Manage model lifecycle (startup/shutdown)."""
     await load_model_fn()
     yield
@@ -140,13 +120,13 @@ app = FastAPI(lifespan=lifespan)
 async def health() -> dict:
     """Health check endpoint for container orchestration."""
     try:
-        if (
-            model_state.model is None
-            or model_state.tokenizer is None
-            or model_state.feature_extractor is None
-        ):
+        if model_state.model is None or model_state.processor is None:
             return {"status": "loading", "model_loaded": False}
-        return {"status": "healthy", "model_loaded": True, "device": str(model_state.device)}
+        return {
+            "status": "healthy",
+            "model_loaded": True,
+            "device": str(model_state.device),
+        }
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         return {"status": "unhealthy", "error": str(e)}
@@ -156,24 +136,6 @@ async def health() -> dict:
 async def list_models() -> dict:
     """List available models."""
     return {"data": [{"id": "glm-nano-2512", "object": "model"}]}
-
-
-def get_audio_token_length(seconds: float, merge_factor: int = 2) -> int:
-    """Calculate number of audio tokens from duration in seconds."""
-
-    def get_T_after_cnn(L_in: int, dilation: int = 1) -> int:
-        """Apply CNN transformations to compute output length."""
-        for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
-            L_out = L_in + 2 * padding - dilation * (kernel_size - 1) - 1
-            L_out = 1 + L_out // stride
-            L_in = L_out
-        return L_out
-
-    mel_len = int(seconds * 100)
-    audio_len_after_cnn = get_T_after_cnn(mel_len)
-    audio_token_num = (audio_len_after_cnn - merge_factor) // merge_factor + 1
-    audio_token_num = min(audio_token_num, 1500 // merge_factor)
-    return audio_token_num
 
 
 def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
@@ -194,127 +156,52 @@ def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
         return chunks
     except Exception as e:
         logger.error(f"[AUDIO CHUNKING FAILED] {str(e)}")
-        return [(0, duration_ms)]
+        # Return full duration as single chunk on error
+        try:
+            audio = AudioSegment.from_file(audio_path)
+            return [(0, len(audio))]
+        except Exception:
+            return [(0, 0)]
 
 
-def build_prompt(audio_path: str, merge_factor: int, chunk_seconds: int = 30) -> dict:
-    """Build prompt batch from audio file."""
-    logger.debug(f"[BUILD_PROMPT] Loading audio from {audio_path}")
-    wav, sr = torchaudio.load(audio_path)
-    logger.debug(f"  - Loaded shape: {wav.shape}, sample rate: {sr}")
-
-    wav = wav[:1, :]
-    logger.debug(f"  - After mono conversion: {wav.shape}")
-
-    assert model_state.feature_extractor is not None
-    assert model_state.tokenizer is not None
-
-    if sr != model_state.feature_extractor.sampling_rate:
-        logger.debug(
-            f"  - Resampling from {sr} to {model_state.feature_extractor.sampling_rate}"
-        )
-        wav = torchaudio.transforms.Resample(
-            sr, model_state.feature_extractor.sampling_rate
-        )(wav)
-        logger.debug(f"  - After resampling: {wav.shape}")
-
-    tokens = []
-    tokens += model_state.tokenizer.encode("<|user|>")
-    tokens += model_state.tokenizer.encode("\n")
-    logger.debug(f"  - Initial tokens: {len(tokens)}")
-
-    audios = []
-    audio_offsets = []
-    audio_length = []
-    chunk_size = chunk_seconds * model_state.feature_extractor.sampling_rate
-    total_chunks = (wav.shape[1] + chunk_size - 1) // chunk_size
-    logger.debug(
-        f"  - Total chunks to process: {total_chunks} (chunk_size={chunk_size})"
-    )
-
-    for chunk_idx, start in enumerate(range(0, wav.shape[1], chunk_size)):
-        chunk = wav[:, start : start + chunk_size]
-        logger.debug(f"    - Chunk {chunk_idx + 1}/{total_chunks}: shape={chunk.shape}")
-
-        mel = model_state.feature_extractor(
-            chunk.numpy(),
-            sampling_rate=model_state.feature_extractor.sampling_rate,
-            return_tensors="pt",
-            padding="max_length",
-        )["input_features"]
-        logger.debug(f"      - MEL shape: {mel.shape}")
-
-        audios.append(mel)
-        seconds = chunk.shape[1] / model_state.feature_extractor.sampling_rate
-        num_tokens = get_audio_token_length(seconds, merge_factor)
-
-        tokens += model_state.tokenizer.encode("<|begin_of_audio|>")
-        audio_offsets.append(len(tokens))
-        tokens += [0] * num_tokens
-        tokens += model_state.tokenizer.encode("<|end_of_audio|>")
-        audio_length.append(num_tokens)
-
-        logger.debug(
-            f"      - Duration: {seconds:.2f}s, tokens: {num_tokens}, "
-            f"total tokens now: {len(tokens)}"
-        )
-
-    if not audios:
-        logger.error("[BUILD_PROMPT] No audio chunks loaded!")
-        raise ValueError("Audio is empty or failed to load")
-
-    tokens += model_state.tokenizer.encode("<|user|>")
-    tokens += model_state.tokenizer.encode("\nPlease transcribe this audio into text")
-    tokens += model_state.tokenizer.encode("<|assistant|>")
-    tokens += model_state.tokenizer.encode("\n")
-
-    batch = {
-        "input_ids": torch.tensor([tokens], dtype=torch.long),
-        "audios": torch.cat(audios, dim=0),
-        "audio_offsets": [audio_offsets],
-        "audio_length": [audio_length],
-        "attention_mask": torch.ones(1, len(tokens), dtype=torch.long),
-    }
-    return batch
-
-
-def run_inference(batch: dict) -> str:
-    """Run inference on prepared batch and return transcript."""
+def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
+    """Transcribe a single audio array using the new GLM-ASR API."""
     assert model_state.model is not None
-    assert model_state.tokenizer is not None
-    assert model_state.device is not None
+    assert model_state.processor is not None
 
-    # Prepare inputs
-    logger.debug("[MODEL PREP] Moving tensors to device...")
-    input_ids = batch["input_ids"].to(model_state.device)
-    attention_mask = batch["attention_mask"].to(model_state.device)
-    audios = batch["audios"].to(model_state.device)
+    # Resample if needed
+    target_sr = model_state.processor.feature_extractor.sampling_rate
+    if sampling_rate != target_sr:
+        logger.debug(f"Resampling from {sampling_rate} to {target_sr}")
+        audio_tensor = torch.from_numpy(audio_array).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        resampler = torchaudio.transforms.Resample(sampling_rate, target_sr)
+        audio_tensor = resampler(audio_tensor)
+        audio_array = audio_tensor.squeeze(0).numpy()
 
-    model_inputs = {
-        "inputs": input_ids,
-        "attention_mask": attention_mask,
-        "audios": audios.to(torch.bfloat16),
-        "audio_offsets": batch["audio_offsets"],
-        "audio_length": batch["audio_length"],
-    }
-    prompt_len = input_ids.size(1)
+    # Use the processor's apply_transcription_request method
+    inputs = model_state.processor.apply_transcription_request(audio_array)
 
-    # Inference
+    # Move to device and dtype
+    inputs = inputs.to(model_state.model.device, dtype=model_state.model.dtype)
+
+    # Generate
     logger.info("[INFERENCE START] Running model.generate()...")
     with torch.no_grad():
-        generated = model_state.model.generate(
-            **model_inputs,
-            max_new_tokens=128,
+        outputs = model_state.model.generate(
+            **inputs,
             do_sample=False,
+            max_new_tokens=MAX_NEW_TOKENS,
         )
     logger.info("[INFERENCE SUCCESS] Generation completed")
 
-    # Decode
-    logger.debug("[DECODING] Extracting and decoding transcript...")
-    transcript_ids = generated[0, prompt_len:].cpu().tolist()
-    transcript = model_state.tokenizer.decode(
-        transcript_ids, skip_special_tokens=True
-    ).strip()
+    # Decode - skip input tokens
+    prompt_len = inputs.input_ids.shape[1]
+    transcript = model_state.processor.batch_decode(
+        outputs[:, prompt_len:],
+        skip_special_tokens=True,
+    )[0].strip()
 
     logger.info(
         f"[TRANSCRIPTION RESULT] '{transcript[:100]}'"
@@ -330,12 +217,7 @@ async def transcribe(
     """Transcribe audio file to text."""
     logger.debug("=== TRANSCRIPTION REQUEST RECEIVED ===")
 
-    if (
-        not model_state.model
-        or not model_state.tokenizer
-        or not model_state.feature_extractor
-        or not model_state.config
-    ):
+    if not model_state.model or not model_state.processor:
         logger.error("Model not loaded!")
         raise HTTPException(500, "Model not loaded")
 
@@ -401,8 +283,10 @@ async def transcribe(
                 # Try to load as-is to check properties
                 if is_wav:
                     logger.debug("[AUDIO CHECK] File is WAV, probing properties...")
-                    wav, sr = torchaudio.load(input_path)
-                    duration_seconds = wav.shape[1] / sr
+                    wav_data, sr = sf.read(input_path)
+                    # sf.read returns (frames, channels) or (frames,)
+                    # We just need duration
+                    duration_seconds = len(wav_data) / sr
                     logger.debug(
                         f"  - Sample rate: {sr}, duration: {duration_seconds:.2f}s"
                     )
@@ -491,21 +375,32 @@ async def transcribe(
             raise HTTPException(500, f"Audio processing error: {str(e)}")
 
         try:
-            # Split audio into chunks
+            # Load the audio
+            wav_data, sr = sf.read(audio_path)
+            # Ensure float32
+            wav_data = wav_data.astype(np.float32)
+
+            # sf.read returns (frames, channels) or (frames,)
+            # Convert to (channels, frames) for consistency if needed, but we pass to transcribe_audio_array as numpy
+            if wav_data.ndim > 1:
+                # Mix down to mono by averaging channels
+                wav_data = wav_data.mean(axis=1)
+
+            audio_array = wav_data
+
+            # Split audio into chunks if needed
             chunks = split_audio_into_chunks(audio_path)
 
             if len(chunks) == 1:
                 # Single chunk - process normally
                 logger.info("[AUDIO CHUNKING] Processing as single chunk")
-                batch = build_prompt(audio_path, model_state.config.merge_factor)
-                logger.info("[AUDIO PROMPT] Built successfully")
-                transcript = run_inference(batch)
+                transcript = transcribe_audio_array(audio_array, sr)
             else:
                 # Multiple chunks - process each and merge
                 logger.info(
                     f"[AUDIO CHUNKING] Processing {len(chunks)} chunks sequentially"
                 )
-                audio = AudioSegment.from_file(audio_path)
+                audio_segment = AudioSegment.from_file(audio_path)
                 transcripts = []
 
                 for chunk_idx, (start_ms, end_ms) in enumerate(chunks, 1):
@@ -514,27 +409,26 @@ async def transcribe(
                     )
 
                     # Extract chunk
-                    audio_chunk = audio[start_ms:end_ms]
+                    audio_chunk = audio_segment[start_ms:end_ms]
 
-                    # Save chunk to temp file
-                    chunk_path = os.path.join(
-                        os.path.dirname(audio_path), f"chunk_{chunk_idx}.wav"
+                    # Convert to numpy array
+                    chunk_array = np.array(audio_chunk.get_array_of_samples()).astype(
+                        np.float32
                     )
-                    audio_chunk.export(chunk_path, format="wav")
+                    chunk_array = chunk_array / 32768.0  # Normalize int16 to float
 
                     try:
-                        batch = build_prompt(
-                            audio_path, model_state.config.merge_factor
+                        chunk_text = transcribe_audio_array(
+                            chunk_array, audio_chunk.frame_rate
                         )
-                        chunk_text = run_inference(batch)
 
                         if chunk_text:
                             transcripts.append(chunk_text)
                             logger.info(
                                 f"[CHUNK {chunk_idx}] Result: '{chunk_text[:80]}'"
                             )
-                    finally:
-                        os.unlink(chunk_path)
+                    except Exception as e:
+                        logger.error(f"[CHUNK {chunk_idx}] Failed: {str(e)}")
 
                 transcript = " ".join(transcripts)
                 logger.info(
