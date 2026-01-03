@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import anyio
 import ffmpeg
@@ -17,35 +17,13 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from silero_vad import load_silero_vad, get_speech_timestamps
 from sse_starlette.sse import EventSourceResponse
 from pydub import AudioSegment
 from transformers import AutoProcessor, GlmAsrForConditionalGeneration
-
-logger = logging.getLogger(__name__)
-
-
-class TranscriptionResponse(BaseModel):
-    """Response model for transcription endpoint."""
-
-    text: str
-
-
-class ModelState:
-    """Container for model and component states."""
-
-    def __init__(self) -> None:
-        """Initialize model state with None values."""
-        self.model: Optional[GlmAsrForConditionalGeneration] = None
-        self.processor: Optional[AutoProcessor] = None
-        self.device: Optional[torch.device] = None
-        self.vad_model: Optional[Any] = None
-
-
-model_state = ModelState()
 
 MODEL_ID = os.getenv("MODEL_ID", "zai-org/GLM-ASR-Nano-2512")
 PORT = int(os.getenv("PORT", "8000"))
@@ -82,6 +60,32 @@ def setup_logging() -> None:
             level=logging.INFO,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
+
+
+# Initialize logging at module load time
+setup_logging()
+
+logger = logging.getLogger(__name__)
+
+
+class TranscriptionResponse(BaseModel):
+    """Response model for transcription endpoint."""
+
+    text: str
+
+
+class ModelState:
+    """Container for model and component states."""
+
+    def __init__(self) -> None:
+        """Initialize model state with None values."""
+        self.model: Optional[GlmAsrForConditionalGeneration] = None
+        self.processor: Optional[AutoProcessor] = None
+        self.device: Optional[torch.device] = None
+        self.vad_model: Optional[Any] = None
+
+
+model_state = ModelState()
 
 
 async def load_model_fn() -> None:
@@ -159,6 +163,27 @@ async def list_models() -> dict:
     }
 
 
+def format_timestamp(ms: int) -> str:
+    """Convert milliseconds to SRT timestamp format (HH:MM:SS,mmm)."""
+    s, ms = divmod(ms, 1000)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def segments_to_srt(segments: list[dict]) -> str:
+    """Convert a list of timed segments to SRT format."""
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = format_timestamp(seg["start_ms"])
+        end = format_timestamp(seg["end_ms"])
+        lines.append(f"{i}")
+        lines.append(f"{start} --> {end}")
+        lines.append(f"{seg['text']}")
+        lines.append("")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
 def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
     """Load audio and return list of (start_ms, end_ms) tuples for chunks using VAD."""
     try:
@@ -186,37 +211,40 @@ def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
         
         if not speech_timestamps:
             logger.info("[VAD] No speech detected, falling back to fixed chunking")
-            # Fallback to single chunk or fixed splitting
-            return [(0, duration_ms)]
+            return _fixed_duration_chunks(duration_ms)
 
-        chunks = []
-        current_chunk_start = speech_timestamps[0]['start'] / 16  # convert samples to ms
-        current_chunk_end = speech_timestamps[0]['end'] / 16
-        
         # Helper to convert sample index to ms
         def s2ms(samples): return samples / 16.0
-
-        for i in range(1, len(speech_timestamps)):
-            seg = speech_timestamps[i]
+        
+        # First, expand any speech segments that are too long into multiple segments
+        expanded_segments = []
+        for seg in speech_timestamps:
             seg_start_ms = s2ms(seg['start'])
             seg_end_ms = s2ms(seg['end'])
+            seg_duration = seg_end_ms - seg_start_ms
+            
+            if seg_duration <= CHUNK_DURATION_MS:
+                expanded_segments.append((seg_start_ms, seg_end_ms))
+            else:
+                # Split long segment into CHUNK_DURATION_MS pieces
+                pos = seg_start_ms
+                while pos < seg_end_ms:
+                    chunk_end = min(pos + CHUNK_DURATION_MS, seg_end_ms)
+                    expanded_segments.append((pos, chunk_end))
+                    pos = chunk_end
+        
+        # Now merge segments into chunks, respecting max duration
+        chunks = []
+        current_chunk_start = expanded_segments[0][0]
+        current_chunk_end = expanded_segments[0][1]
+
+        for i in range(1, len(expanded_segments)):
+            seg_start_ms, seg_end_ms = expanded_segments[i]
             
             # Check if adding this segment would exceed max duration
-            # We look at the gap between current chunk end and this segment end
-            # Ideally we want to cut in the silence between current_chunk_end and seg_start_ms
-            
             if (seg_end_ms - current_chunk_start) > CHUNK_DURATION_MS:
-                # Close current chunk
-                # Cut point is midpoint of silence or seg_start_ms
-                # But we can just use the previous segment's end or start of this one.
-                # Let's use the start of the current segment as the split point (start of speech)
-                # so the silence belongs to the previous chunk (or ignored)
-                
-                # Refined: We want the chunk to end in silence.
-                # The silence is between `current_chunk_end` and `seg_start_ms`.
-                # Let's split at `seg_start_ms` (minus a small buffer if possible, but strict cut is fine).
-                
-                chunks.append((int(current_chunk_start), int(seg_start_ms)))
+                # Close current chunk at the start of silence (current_chunk_end)
+                chunks.append((int(current_chunk_start), int(current_chunk_end)))
                 current_chunk_start = seg_start_ms
                 current_chunk_end = seg_end_ms
             else:
@@ -226,36 +254,37 @@ def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
         # Add final chunk
         chunks.append((int(current_chunk_start), int(current_chunk_end)))
         
-        # Sanity check: Ensure we cover the audio reasonable well or at least don't crash
-        # If the last chunk doesn't reach the end, we might miss trailing audio, 
-        # but VAD says it's silence.
-        
-        logger.info(f"[AUDIO CHUNKING] VAD split {duration_ms}ms into {len(chunks)} chunks")
+        logger.info(f"[AUDIO CHUNKING] VAD split {duration_ms}ms into {len(chunks)} chunks (max {CHUNK_DURATION_MS}ms each)")
+        for i, (start, end) in enumerate(chunks):
+            logger.info(f"  Chunk {i+1}: {start}ms - {end}ms ({end-start}ms)")
         return chunks
 
     except Exception as e:
         logger.error(f"[AUDIO CHUNKING FAILED] {str(e)}")
-        # Fallback to fixed duration chunking on error
-        try:
-            audio = AudioSegment.from_file(audio_path)
-            duration_ms = len(audio)
-            chunks = []
-            step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+        return _fixed_duration_chunks(duration_ms if 'duration_ms' in dir() else 0)
 
-            for i in range(0, duration_ms, step):
-                chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
-                chunks.append((i, chunk_end))
-                if chunk_end >= duration_ms:
-                    break
-            return chunks
-        except Exception:
-            return [(0, 0)]
+
+def _fixed_duration_chunks(duration_ms: int) -> list[tuple[int, int]]:
+    """Fallback to fixed duration chunking."""
+    if duration_ms <= 0:
+        return [(0, 0)]
+    chunks = []
+    step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+
+    for i in range(0, duration_ms, step):
+        chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
+        chunks.append((i, chunk_end))
+        if chunk_end >= duration_ms:
+            break
+    return chunks
 
 
 def _transcribe_audio_array_sync(audio_array: np.ndarray, sampling_rate: int, language: str = "auto") -> str:
     """Synchronous core transcription function to be run in a thread."""
     assert model_state.model is not None
     assert model_state.processor is not None
+
+    logger.info(f"[MODEL INFERENCE] Starting inference on {len(audio_array)/sampling_rate:.1f}s of audio...")
 
     # Resample if needed
     target_sr = model_state.processor.feature_extractor.sampling_rate
@@ -280,6 +309,7 @@ def _transcribe_audio_array_sync(audio_array: np.ndarray, sampling_rate: int, la
     inputs = inputs.to(model_state.model.device, dtype=model_state.model.dtype)
 
     # Generate
+    logger.info("[MODEL INFERENCE] Running model.generate()...")
     with torch.no_grad():
         outputs = model_state.model.generate(
             **inputs,
@@ -334,7 +364,7 @@ async def transcribe_stream_generator(
             logger.info(
                 f"[SSE CHUNK {chunk_idx}/{len(chunks)}] Processing {start_ms}ms-{end_ms}ms..."
             )
-            audio_chunk = audio_segment[start_ms:end_ms]
+            audio_chunk = audio_segment[start_ms:end_ms].set_channels(1)
             chunk_array = np.array(audio_chunk.get_array_of_samples()).astype(
                 np.float32
             )
@@ -359,9 +389,13 @@ async def transcribe(
     file: UploadFile = File(...),
     language: Optional[str] = Form("auto"),
     stream: bool = Form(False),
+    response_format: Literal["text", "srt"] = Form("text"),
 ):
     """Transcribe audio file to text."""
-    logger.debug("=== TRANSCRIPTION REQUEST RECEIVED ===")
+    logger.info("=== TRANSCRIPTION REQUEST RECEIVED ===")
+
+    if stream and response_format == "srt":
+        raise HTTPException(400, "SRT format is not supported with streaming mode")
 
     if not model_state.model or not model_state.processor:
         logger.error("Model not loaded!")
@@ -378,7 +412,7 @@ async def transcribe(
 
     # Read file with size check
     try:
-        logger.debug("Reading file content from request...")
+        logger.info("Reading file content from request...")
         content = await file.read()
 
         if len(content) == 0:
@@ -411,7 +445,7 @@ async def transcribe(
         raise HTTPException(400, f"Failed to read uploaded file: {str(e)}")
 
     # Check if conversion is needed
-    logger.debug("[AUDIO CHECK] Checking if conversion is needed...")
+    logger.info("[AUDIO PROCESSING] Starting audio processing...")
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input_audio")
         audio_path = os.path.join(tmpdir, "audio.wav")
@@ -567,50 +601,51 @@ async def transcribe(
                 )
 
             # Non-streaming mode: process all chunks and return complete response
-            if len(chunks) == 1:
-                # Single chunk - process normally
-                logger.info("[AUDIO CHUNKING] Processing as single chunk")
-                transcript = await transcribe_audio_array(audio_array, sr, language=language)
-            else:
-                # Multiple chunks - process each and merge
+            segments = []
+            audio_segment = AudioSegment.from_file(audio_path)
+
+            for chunk_idx, (start_ms, end_ms) in enumerate(chunks, 1):
                 logger.info(
-                    f"[AUDIO CHUNKING] Processing {len(chunks)} chunks sequentially"
+                    f"[CHUNK {chunk_idx}/{len(chunks)}] Processing {start_ms}ms-{end_ms}ms..."
                 )
-                audio_segment = AudioSegment.from_file(audio_path)
-                transcripts = []
 
-                for chunk_idx, (start_ms, end_ms) in enumerate(chunks, 1):
-                    logger.info(
-                        f"[CHUNK {chunk_idx}/{len(chunks)}] Processing {start_ms}ms-{end_ms}ms..."
+                # Extract chunk and convert to mono
+                audio_chunk = audio_segment[start_ms:end_ms].set_channels(1)
+
+                # Convert to numpy array
+                chunk_array = np.array(audio_chunk.get_array_of_samples()).astype(
+                    np.float32
+                )
+                chunk_array = chunk_array / 32768.0  # Normalize int16 to float
+
+                try:
+                    chunk_text = await transcribe_audio_array(
+                        chunk_array, audio_chunk.frame_rate, language=language
                     )
 
-                    # Extract chunk
-                    audio_chunk = audio_segment[start_ms:end_ms]
-
-                    # Convert to numpy array
-                    chunk_array = np.array(audio_chunk.get_array_of_samples()).astype(
-                        np.float32
-                    )
-                    chunk_array = chunk_array / 32768.0  # Normalize int16 to float
-
-                    try:
-                        chunk_text = await transcribe_audio_array(
-                            chunk_array, audio_chunk.frame_rate, language=language
+                    if chunk_text:
+                        segments.append({
+                            "start_ms": start_ms,
+                            "end_ms": end_ms,
+                            "text": chunk_text
+                        })
+                        logger.info(
+                            f"[CHUNK {chunk_idx}] Result: '{chunk_text[:80]}'"
                         )
+                except Exception as e:
+                    logger.error(f"[CHUNK {chunk_idx}] Failed: {str(e)}")
 
-                        if chunk_text:
-                            transcripts.append(chunk_text)
-                            logger.info(
-                                f"[CHUNK {chunk_idx}] Result: '{chunk_text[:80]}'"
-                            )
-                    except Exception as e:
-                        logger.error(f"[CHUNK {chunk_idx}] Failed: {str(e)}")
+            if response_format == "srt":
+                logger.info(f"[SRT OUTPUT] Generating SRT from {len(segments)} segments")
+                srt_output = segments_to_srt(segments)
+                logger.info(f"[SRT OUTPUT] Generated {len(srt_output)} bytes of SRT content")
+                return Response(content=srt_output, media_type="text/plain")
 
-                transcript = " ".join(transcripts)
-                logger.info(
-                    f"[TRANSCRIPTION COMPLETE] Merged {len(transcripts)} chunks "
-                    f"into {len(transcript)} chars"
-                )
+            transcript = " ".join([seg["text"] for seg in segments])
+            logger.info(
+                f"[TRANSCRIPTION COMPLETE] Merged {len(segments)} chunks "
+                f"into {len(transcript)} chars"
+            )
 
             return TranscriptionResponse(text=transcript or "[Empty transcription]")
 
