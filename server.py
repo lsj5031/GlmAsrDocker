@@ -41,6 +41,8 @@ CHUNK_DURATION_MS = 30 * 1000  # 30 second chunks
 CHUNK_OVERLAP_MS = 2 * 1000  # 2 second overlap
 JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "500"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "600"))  # 10 minutes default
+MAX_AUDIO_SIZE_MB = int(os.getenv("MAX_AUDIO_SIZE_MB", "500"))  # 500MB max
 
 
 def setup_logging() -> None:
@@ -445,6 +447,16 @@ async def transcribe(
         if len(content) == 0:
             logger.error("File content is empty")
             raise HTTPException(400, "Empty file received")
+        
+        # Check max file size
+        max_bytes = MAX_AUDIO_SIZE_MB * 1024 * 1024
+        if len(content) > max_bytes:
+            logger.error(f"File too large: {len(content) / (1024*1024):.1f}MB > {MAX_AUDIO_SIZE_MB}MB")
+            raise HTTPException(
+                413, 
+                f"File too large. Maximum size: {MAX_AUDIO_SIZE_MB}MB. "
+                f"For longer audio, please split into smaller chunks on the client side."
+            )
 
         # Check for valid audio file headers
         file_sig = content[:4].hex().lower()
@@ -703,6 +715,7 @@ WS_TRANSCRIBE_INTERVAL_SEC = (
     0.8  # Transcribe every 0.8s of new audio for faster feedback
 )
 WS_MAX_BUFFER_MS = 25000  # Force flush after 25s to prevent latency lag
+WS_CONTEXT_WINDOW_MS = 3000  # Keep last 3s as context when flushing
 
 
 @app.websocket("/v1/audio/transcriptions/stream")
@@ -786,11 +799,16 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
                             )
 
                         if is_force_flush:
-                            # Reset buffer and state
-                            audio_buffer = np.array([], dtype=np.float32)
-                            last_inference_audio_len = 0
+                            # Keep last N seconds as context to avoid cutting words
+                            context_samples = int(WS_SAMPLE_RATE * (WS_CONTEXT_WINDOW_MS / 1000))
+                            if len(audio_buffer) > context_samples:
+                                audio_buffer = audio_buffer[-context_samples:]
+                                last_inference_audio_len = len(audio_buffer)
+                            else:
+                                audio_buffer = np.array([], dtype=np.float32)
+                                last_inference_audio_len = 0
                             last_transcription = ""
-                            logger.info("[WS] Buffer flushed due to size limit")
+                            logger.info(f"[WS] Buffer flushed, kept {len(audio_buffer)/WS_SAMPLE_RATE:.1f}s context")
                         else:
                             last_inference_audio_len = len(audio_buffer)
 

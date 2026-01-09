@@ -9,11 +9,13 @@ services:
     volumes:
       - ~/.cache/huggingface:/home/appuser/.cache/huggingface
       - ./server.py:/app/server.py
-    command: uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn server:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 650
     environment:
       - PORT=8000
       - MODEL_ID=zai-org/GLM-ASR-Nano-2512
       - JSON_LOGGING=false
+      - REQUEST_TIMEOUT=600
+      - MAX_AUDIO_SIZE_MB=500
     deploy:
       resources:
         reservations:
