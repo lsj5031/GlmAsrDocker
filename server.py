@@ -975,8 +975,11 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
     except Exception as e:
         logger.error(f"[WS] Error: {e}", exc_info=True)
     finally:
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.close()
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close()
+        except RuntimeError:
+            pass
         logger.info("[WS] Connection closed")
 
 
@@ -996,6 +999,8 @@ RT_VAD_PREFIX_PADDING_MS = int(os.getenv("RT_VAD_PREFIX_PADDING_MS", "300"))
 RT_VAD_SILENCE_MS = int(os.getenv("RT_VAD_SILENCE_MS", "500"))
 RT_VAD_MIN_SPEECH_MS = int(os.getenv("RT_VAD_MIN_SPEECH_MS", "250"))
 RT_MAX_BUFFER_SEC = 30  # hard cap: force commit if buffer exceeds this
+RT_INTERIM_INTERVAL_SEC = float(os.getenv("RT_INTERIM_INTERVAL_SEC", "1.5"))
+RT_VAD_SAMPLE_RATE = 16000  # Silero VAD only supports 8000 and 16000 Hz
 
 
 def _rt_event(event_type: str, **kwargs) -> dict:
@@ -1031,7 +1036,29 @@ class RealtimeTranscriptionSession:
         self.vad_ring: list[np.ndarray] = []
         self.vad_ring_samples: int = 0
 
+        # Speech state tracking for VAD auto-commit
+        self._speech_active: bool = False
+        self._speech_start_ms: int = 0
+        self._current_speech_item_id: Optional[str] = None
+        self._last_interim_time: float = 0.0
+        self._last_interim_transcript: str = ""  # cumulative text sent via deltas
+
+        # Cached resampler for VAD (avoids re-creation per chunk)
+        self._vad_resampler: Optional[torchaudio.transforms.Resample] = None
+        self._vad_resampler_src_rate: int = 0
+        self._update_vad_resampler()
+
     # ---- helpers ----
+
+    async def _safe_send_json(self, data: dict) -> bool:
+        """Send JSON to the WebSocket, returning False if the connection is closed."""
+        if self.ws.client_state != WebSocketState.CONNECTED:
+            return False
+        try:
+            await self.ws.send_json(data)
+            return True
+        except RuntimeError:
+            return False
 
     def _next_item_id(self) -> str:
         self.item_counter += 1
@@ -1049,17 +1076,17 @@ class RealtimeTranscriptionSession:
     # ---- session events ----
 
     async def send_created(self) -> None:
-        await self.ws.send_json(
+        await self._safe_send_json(
             _rt_event("transcription_session.created", session=self._session_dict())
         )
 
     async def send_updated(self) -> None:
-        await self.ws.send_json(
+        await self._safe_send_json(
             _rt_event("transcription_session.updated", session=self._session_dict())
         )
 
     async def send_error(self, message: str) -> None:
-        await self.ws.send_json(
+        await self._safe_send_json(
             _rt_event("error", error={"type": "invalid_request_error", "message": message})
         )
 
@@ -1098,6 +1125,94 @@ class RealtimeTranscriptionSession:
         if self.turn_detection_type == "server_vad":
             await self._maybe_vad_commit()
 
+    def _update_vad_resampler(self) -> None:
+        """Create or update the cached resampler when sample_rate changes."""
+        if self.sample_rate != RT_VAD_SAMPLE_RATE and self.sample_rate != self._vad_resampler_src_rate:
+            self._vad_resampler = torchaudio.transforms.Resample(self.sample_rate, RT_VAD_SAMPLE_RATE)
+            self._vad_resampler_src_rate = self.sample_rate
+        elif self.sample_rate == RT_VAD_SAMPLE_RATE:
+            self._vad_resampler = None
+            self._vad_resampler_src_rate = self.sample_rate
+
+    def _resample_for_vad(self, arr: np.ndarray) -> np.ndarray:
+        """Resample audio to 16 kHz for Silero VAD (supports 8000/16000 only)."""
+        if self._vad_resampler is None:
+            return arr
+        vad_tensor = torch.from_numpy(arr).float().unsqueeze(0)
+        return self._vad_resampler(vad_tensor).squeeze(0).numpy()
+
+    async def _emit_speech_started(self) -> None:
+        """Emit input_audio_buffer.speech_started event."""
+        item_id = self._next_item_id()
+        self._current_speech_item_id = item_id
+        self._speech_start_ms = int(self.buffer_samples / self.sample_rate * 1000)
+        self._last_interim_time = time.time()
+        await self._safe_send_json(
+            _rt_event(
+                "input_audio_buffer.speech_started",
+                audio_start_ms=self._speech_start_ms,
+                item_id=item_id,
+            )
+        )
+        logger.info(f"[RT-VAD] Speech started at {self._speech_start_ms}ms")
+
+    async def _emit_speech_stopped(self) -> None:
+        """Emit input_audio_buffer.speech_stopped event."""
+        audio_end_ms = int(self.buffer_samples / self.sample_rate * 1000)
+        await self._safe_send_json(
+            _rt_event(
+                "input_audio_buffer.speech_stopped",
+                audio_end_ms=audio_end_ms,
+                item_id=self._current_speech_item_id,
+            )
+        )
+        logger.info(f"[RT-VAD] Speech stopped at {audio_end_ms}ms")
+
+    async def _maybe_send_interim(self, arr: np.ndarray) -> None:
+        """Send interim transcript.text.delta with only the incremental new text."""
+        now = time.time()
+        if now - self._last_interim_time < RT_INTERIM_INTERVAL_SEC:
+            return
+        if len(arr) < self.sample_rate * 0.5:
+            return
+
+        try:
+            lang = self.language if self.language else "auto"
+            transcript = await transcribe_audio_array(arr, self.sample_rate, language=lang)
+        except Exception as e:
+            logger.warning(f"[RT-INTERIM] Transcription failed: {e}")
+            return
+
+        if not transcript:
+            return
+
+        self._last_interim_time = now
+
+        # Compute incremental delta: only send new text beyond what was already sent
+        if transcript.startswith(self._last_interim_transcript):
+            delta = transcript[len(self._last_interim_transcript):]
+        else:
+            # Model revised its output — skip this interim delta entirely.
+            # The final transcript.text.done will carry the authoritative text.
+            logger.info(f"[RT-INTERIM] Revision detected, skipping interim delta")
+            self._last_interim_transcript = ""
+            return
+
+        if not delta:
+            return
+
+        self._last_interim_transcript = transcript
+        item_id = self._current_speech_item_id or "interim"
+        await self._safe_send_json(
+            _rt_event(
+                "transcript.text.delta",
+                item_id=item_id,
+                content_index=0,
+                delta=delta,
+            )
+        )
+        logger.info(f"[RT-INTERIM] Delta: '{delta[:80]}'")
+
     async def _maybe_vad_commit(self) -> None:
         """Run Silero VAD on the buffer and commit if speech has ended."""
         if model_state.vad_model is None:
@@ -1115,16 +1230,27 @@ class RealtimeTranscriptionSession:
 
         # Hard cap: force commit if buffer exceeds max
         if self.buffer_samples > self.sample_rate * RT_MAX_BUFFER_SEC:
-            await self._commit_buffer(reason="max_buffer")
+            if self._speech_active:
+                self._speech_active = False
+                await self._emit_speech_stopped()
+            await self._commit_buffer(reason="max_buffer", item_id=self._current_speech_item_id)
+            self._current_speech_item_id = None
             return
 
-        # Run VAD
+        # Resample to 16 kHz for Silero VAD
+        try:
+            vad_arr = self._resample_for_vad(arr)
+        except Exception as e:
+            logger.warning(f"[RT-VAD] Resample failed: {e}")
+            return
+
+        # Run VAD on resampled audio
         try:
             speech_ts = await anyio.to_thread.run_sync(
                 lambda: get_speech_timestamps(
-                    arr,
+                    vad_arr,
                     model_state.vad_model,
-                    sampling_rate=self.sample_rate,
+                    sampling_rate=RT_VAD_SAMPLE_RATE,
                     threshold=self.vad_threshold,
                     min_speech_duration_ms=RT_VAD_MIN_SPEECH_MS,
                     min_silence_duration_ms=self.vad_silence_duration_ms,
@@ -1136,22 +1262,37 @@ class RealtimeTranscriptionSession:
             return
 
         if not speech_ts:
-            # No speech detected in current buffer; if we have a lot of audio, flush
-            if self.buffer_samples > self.sample_rate * 2:
-                # Check if there's a long trailing silence
+            if self._speech_active:
+                # Speech just ended — no segments remain
+                self._speech_active = False
+                await self._emit_speech_stopped()
+                await self._commit_buffer(reason="vad_silence", item_id=self._current_speech_item_id)
+                self._current_speech_item_id = None
+            elif self.buffer_samples > self.sample_rate * 2:
                 await self._commit_buffer(reason="silence")
             return
 
+        # Speech detected — emit speech_started on first detection
+        if not self._speech_active:
+            self._speech_active = True
+            await self._emit_speech_started()
+
         # Check if the last speech segment ended well before the buffer end
         last_speech_end = speech_ts[-1]["end"]
-        silence_after = len(arr) - last_speech_end
-        silence_samples = int(self.sample_rate * (self.vad_silence_duration_ms / 1000.0))
+        silence_after = len(vad_arr) - last_speech_end
+        silence_samples = int(RT_VAD_SAMPLE_RATE * (self.vad_silence_duration_ms / 1000.0))
 
         if silence_after >= silence_samples and last_speech_end > 0:
-            # Speech has ended → commit the buffer up to the end of speech
-            await self._commit_buffer(reason="vad_silence")
+            # Speech has ended → commit the buffer
+            self._speech_active = False
+            await self._emit_speech_stopped()
+            await self._commit_buffer(reason="vad_silence", item_id=self._current_speech_item_id)
+            self._current_speech_item_id = None
+        else:
+            # Speech is still active — send interim transcription
+            await self._maybe_send_interim(arr)
 
-    async def _commit_buffer(self, reason: str = "manual") -> None:
+    async def _commit_buffer(self, reason: str = "manual", item_id: Optional[str] = None) -> None:
         """Commit the current audio buffer, transcribe it, and send events."""
         arr = self._get_buffer_array()
         if arr is None:
@@ -1163,11 +1304,12 @@ class RealtimeTranscriptionSession:
         if arr_len < self.sample_rate * 0.1:
             return
 
-        item_id = self._next_item_id()
+        if item_id is None:
+            item_id = self._next_item_id()
         previous_item_id = getattr(self, "_last_item_id", None)
 
         # 1. Send input_audio_buffer.committed
-        await self.ws.send_json(
+        await self._safe_send_json(
             _rt_event(
                 "input_audio_buffer.committed",
                 item_id=item_id,
@@ -1183,7 +1325,7 @@ class RealtimeTranscriptionSession:
             transcript = await transcribe_audio_array(arr, self.sample_rate, language=lang)
         except Exception as e:
             logger.error(f"[RT-TRANSCRIBE] Transcription failed: {e}")
-            await self.ws.send_json(
+            await self._safe_send_json(
                 _rt_event(
                     "transcript.text.done",
                     item_id=item_id,
@@ -1195,22 +1337,28 @@ class RealtimeTranscriptionSession:
             return
 
         if not transcript:
+            self._last_interim_transcript = ""
             self._clear_buffer()
             return
 
-        # 3. Send delta event (full transcript as one delta for simplicity —
-        #    GLM-ASR doesn't stream tokens, so we send the whole thing)
-        await self.ws.send_json(
-            _rt_event(
-                "transcript.text.delta",
-                item_id=item_id,
-                content_index=0,
-                delta=transcript,
-            )
-        )
+        # 3. Send remaining delta (only the text not yet sent via interim deltas)
+        if transcript.startswith(self._last_interim_transcript):
+            remaining_delta = transcript[len(self._last_interim_transcript):]
+        else:
+            remaining_delta = transcript
 
-        # 4. Send completed event
-        await self.ws.send_json(
+        if remaining_delta:
+            await self._safe_send_json(
+                _rt_event(
+                    "transcript.text.delta",
+                    item_id=item_id,
+                    content_index=0,
+                    delta=remaining_delta,
+                )
+            )
+
+        # 4. Send done event with the full utterance text
+        await self._safe_send_json(
             _rt_event(
                 "transcript.text.done",
                 item_id=item_id,
@@ -1220,11 +1368,18 @@ class RealtimeTranscriptionSession:
         )
 
         logger.info(f"[RT] Committed ({reason}): '{transcript[:80]}'")
+        self._last_interim_transcript = ""
         self._clear_buffer()
 
     async def commit_buffer(self) -> None:
         """Public API: commit buffer on explicit client request."""
-        await self._commit_buffer(reason="client_commit")
+        item_id = None
+        if self._speech_active:
+            self._speech_active = False
+            await self._emit_speech_stopped()
+            item_id = self._current_speech_item_id
+            self._current_speech_item_id = None
+        await self._commit_buffer(reason="client_commit", item_id=item_id)
 
     # ---- session dict for responses ----
 
@@ -1273,8 +1428,12 @@ class RealtimeTranscriptionSession:
         elif evt_type == "input_audio_buffer.commit":
             await self.commit_buffer()
         elif evt_type == "input_audio_buffer.clear":
+            self._speech_active = False
+            self._current_speech_item_id = None
+            self._last_interim_time = 0.0
+            self._last_interim_transcript = ""
             self._clear_buffer()
-            await self.ws.send_json(_rt_event("input_audio_buffer.cleared"))
+            await self._safe_send_json(_rt_event("input_audio_buffer.cleared"))
         else:
             logger.warning(f"[RT] Unknown client event type: {evt_type}")
 
@@ -1289,6 +1448,7 @@ class RealtimeTranscriptionSession:
             elif fmt == "pcm8":
                 self.sample_rate = 8000
             # g711 variants would need transcoding — accept but keep 24kHz
+            self._update_vad_resampler()
 
         # Update transcription config
         xcr = event.get("input_audio_transcription")
@@ -1376,8 +1536,11 @@ async def realtime_transcription_ws(
     except Exception as e:
         logger.error(f"[RT-WS] Error: {e}", exc_info=True)
     finally:
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.close()
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close()
+        except RuntimeError:
+            pass
         logger.info("[RT-WS] Connection closed")
 
 
