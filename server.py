@@ -84,9 +84,37 @@ logger = logging.getLogger(__name__)
 
 
 class TranscriptionResponse(BaseModel):
-    """Response model for transcription endpoint."""
+    """Response model for transcription endpoint (text format)."""
 
     text: str
+
+
+class TranscriptionJsonResponse(BaseModel):
+    """OpenAI-compatible JSON response envelope."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+
+
+class TranscriptionSegment(BaseModel):
+    """A single segment in verbose_json output."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseJsonResponse(BaseModel):
+    """OpenAI-compatible verbose_json response envelope."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: list[TranscriptionSegment] = []
 
 
 class ModelState:
@@ -466,15 +494,17 @@ async def transcribe_stream_generator(
 @app.post("/v1/audio/transcriptions", response_model=None)
 async def transcribe(
     file: UploadFile = File(...),
+    model: Optional[str] = Form(None),
     language: Optional[str] = Form("auto"),
     stream: bool = Form(False),
-    response_format: Literal["text", "srt"] = Form("text"),
+    response_format: Literal["text", "json", "verbose_json", "srt"] = Form("text"),
+    timestamp_granularities: Optional[str] = Form(None),
 ):
     """Transcribe audio file to text."""
     logger.info("=== TRANSCRIPTION REQUEST RECEIVED ===")
 
-    if stream and response_format == "srt":
-        raise HTTPException(400, "SRT format is not supported with streaming mode")
+    if stream and response_format in ("srt", "verbose_json"):
+        raise HTTPException(400, f"{response_format} format is not supported with streaming mode")
 
     if not model_state.model or not model_state.processor:
         logger.error("Model not loaded!")
@@ -737,11 +767,44 @@ async def transcribe(
                 return Response(content=srt_output, media_type="text/plain")
 
             transcript = " ".join([seg["text"] for seg in segments])
+            # Calculate audio duration from sample rate and array length
+            audio_duration = round(len(audio_array) / sr, 2) if sr > 0 else 0.0
+            effective_language = language if language and language.lower() != "auto" else None
+
             logger.info(
                 f"[TRANSCRIPTION COMPLETE] Merged {len(segments)} chunks "
                 f"into {len(transcript)} chars"
             )
 
+            if response_format == "verbose_json":
+                # OpenAI verbose_json: include segment-level timestamps
+                verbose_segments = [
+                    TranscriptionSegment(
+                        id=i,
+                        start=round(seg["start_ms"] / 1000.0, 3),
+                        end=round(seg["end_ms"] / 1000.0, 3),
+                        text=seg["text"],
+                    )
+                    for i, seg in enumerate(segments)
+                ]
+                return TranscriptionVerboseJsonResponse(
+                    task="transcribe",
+                    language=effective_language,
+                    duration=audio_duration,
+                    text=transcript or "",
+                    segments=verbose_segments,
+                )
+
+            if response_format == "json":
+                # OpenAI json envelope
+                return TranscriptionJsonResponse(
+                    task="transcribe",
+                    language=effective_language,
+                    duration=audio_duration,
+                    text=transcript or "",
+                )
+
+            # Default text format (backward compatible)
             return TranscriptionResponse(text=transcript or "[Empty transcription]")
 
         except ValueError as e:
@@ -915,6 +978,407 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.close()
         logger.info("[WS] Connection closed")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Realtime API – transcription-only WebSocket endpoint
+# ---------------------------------------------------------------------------
+
+import asyncio
+import base64
+import uuid
+
+# Defaults for the Realtime transcription session
+RT_DEFAULT_INPUT_FORMAT = "pcm16"  # pcm16 = 16-bit PCM, 24kHz (OpenAI default)
+RT_DEFAULT_SAMPLE_RATE = 24000
+RT_VAD_THRESHOLD = float(os.getenv("RT_VAD_THRESHOLD", "0.5"))
+RT_VAD_PREFIX_PADDING_MS = int(os.getenv("RT_VAD_PREFIX_PADDING_MS", "300"))
+RT_VAD_SILENCE_MS = int(os.getenv("RT_VAD_SILENCE_MS", "500"))
+RT_VAD_MIN_SPEECH_MS = int(os.getenv("RT_VAD_MIN_SPEECH_MS", "250"))
+RT_MAX_BUFFER_SEC = 30  # hard cap: force commit if buffer exceeds this
+
+
+def _rt_event(event_type: str, **kwargs) -> dict:
+    """Build a Realtime API server event dict with a unique event_id."""
+    return {"event_id": f"event_{uuid.uuid4().hex[:8]}", "type": event_type, **kwargs}
+
+
+class RealtimeTranscriptionSession:
+    """Manages state for a single OpenAI-compatible Realtime transcription session."""
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self.session_id = f"session_{uuid.uuid4().hex[:12]}"
+        self.item_counter = 0
+
+        # Session config (mutable via transcription_session.update)
+        self.input_audio_format: str = RT_DEFAULT_INPUT_FORMAT
+        self.sample_rate: int = RT_DEFAULT_SAMPLE_RATE
+        self.language: str = ""
+        self.prompt: str = ""
+        self.turn_detection_type: str = "server_vad"
+        self.vad_threshold: float = RT_VAD_THRESHOLD
+        self.vad_prefix_padding_ms: int = RT_VAD_PREFIX_PADDING_MS
+        self.vad_silence_duration_ms: int = RT_VAD_SILENCE_MS
+        self.noise_reduction: Optional[str] = "near_field"
+        self.include_logprobs: bool = False
+
+        # Audio buffer for the current utterance (float32)
+        self.audio_buffer: list[np.ndarray] = []
+        self.buffer_samples: int = 0
+
+        # VAD ring buffer for prefix padding
+        self.vad_ring: list[np.ndarray] = []
+        self.vad_ring_samples: int = 0
+
+    # ---- helpers ----
+
+    def _next_item_id(self) -> str:
+        self.item_counter += 1
+        return f"item_{self.item_counter:03d}"
+
+    def _get_buffer_array(self) -> Optional[np.ndarray]:
+        if not self.audio_buffer:
+            return None
+        return np.concatenate(self.audio_buffer)
+
+    def _clear_buffer(self) -> None:
+        self.audio_buffer.clear()
+        self.buffer_samples = 0
+
+    # ---- session events ----
+
+    async def send_created(self) -> None:
+        await self.ws.send_json(
+            _rt_event("transcription_session.created", session=self._session_dict())
+        )
+
+    async def send_updated(self) -> None:
+        await self.ws.send_json(
+            _rt_event("transcription_session.updated", session=self._session_dict())
+        )
+
+    async def send_error(self, message: str) -> None:
+        await self.ws.send_json(
+            _rt_event("error", error={"type": "invalid_request_error", "message": message})
+        )
+
+    # ---- audio handling ----
+
+    def _pcm16_to_float32(self, raw_bytes: bytes) -> np.ndarray:
+        """Decode PCM16 bytes → float32 array normalised to [-1, 1]."""
+        import struct as _struct
+        n_samples = len(raw_bytes) // 2
+        if n_samples == 0:
+            return np.array([], dtype=np.float32)
+        pcm = np.frombuffer(raw_bytes, dtype=np.int16)
+        return pcm.astype(np.float32) / 32768.0
+
+    def _base64_to_audio(self, b64: str) -> np.ndarray:
+        """Decode Base64 PCM16 → float32."""
+        raw = base64.b64decode(b64)
+        return self._pcm16_to_float32(raw)
+
+    async def append_audio(self, b64_audio: str) -> None:
+        """Append a Base64-encoded PCM16 audio chunk to the buffer."""
+        chunk = self._base64_to_audio(b64_audio)
+        n = len(chunk)
+        self.audio_buffer.append(chunk)
+        self.buffer_samples += n
+
+        # Maintain VAD prefix padding ring
+        self.vad_ring.append(chunk)
+        self.vad_ring_samples += n
+        max_ring = int(self.sample_rate * (self.vad_prefix_padding_ms / 1000.0))
+        while self.vad_ring_samples > max_ring and len(self.vad_ring) > 1:
+            removed = self.vad_ring.pop(0)
+            self.vad_ring_samples -= len(removed)
+
+        # If turn_detection is server_vad, run VAD on the accumulated buffer
+        if self.turn_detection_type == "server_vad":
+            await self._maybe_vad_commit()
+
+    async def _maybe_vad_commit(self) -> None:
+        """Run Silero VAD on the buffer and commit if speech has ended."""
+        if model_state.vad_model is None:
+            return
+
+        arr = self._get_buffer_array()
+        if arr is None:
+            return
+        try:
+            arr_len = len(arr)
+        except TypeError:
+            arr_len = 0
+        if arr_len < self.sample_rate * 0.3:
+            return  # not enough audio yet
+
+        # Hard cap: force commit if buffer exceeds max
+        if self.buffer_samples > self.sample_rate * RT_MAX_BUFFER_SEC:
+            await self._commit_buffer(reason="max_buffer")
+            return
+
+        # Run VAD
+        try:
+            speech_ts = await anyio.to_thread.run_sync(
+                lambda: get_speech_timestamps(
+                    arr,
+                    model_state.vad_model,
+                    sampling_rate=self.sample_rate,
+                    threshold=self.vad_threshold,
+                    min_speech_duration_ms=RT_VAD_MIN_SPEECH_MS,
+                    min_silence_duration_ms=self.vad_silence_duration_ms,
+                    return_seconds=False,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[RT-VAD] VAD failed: {e}")
+            return
+
+        if not speech_ts:
+            # No speech detected in current buffer; if we have a lot of audio, flush
+            if self.buffer_samples > self.sample_rate * 2:
+                # Check if there's a long trailing silence
+                await self._commit_buffer(reason="silence")
+            return
+
+        # Check if the last speech segment ended well before the buffer end
+        last_speech_end = speech_ts[-1]["end"]
+        silence_after = len(arr) - last_speech_end
+        silence_samples = int(self.sample_rate * (self.vad_silence_duration_ms / 1000.0))
+
+        if silence_after >= silence_samples and last_speech_end > 0:
+            # Speech has ended → commit the buffer up to the end of speech
+            await self._commit_buffer(reason="vad_silence")
+
+    async def _commit_buffer(self, reason: str = "manual") -> None:
+        """Commit the current audio buffer, transcribe it, and send events."""
+        arr = self._get_buffer_array()
+        if arr is None:
+            return
+        try:
+            arr_len = len(arr)
+        except TypeError:
+            arr_len = 0
+        if arr_len < self.sample_rate * 0.1:
+            return
+
+        item_id = self._next_item_id()
+        previous_item_id = getattr(self, "_last_item_id", None)
+
+        # 1. Send input_audio_buffer.committed
+        await self.ws.send_json(
+            _rt_event(
+                "input_audio_buffer.committed",
+                item_id=item_id,
+                previous_item_id=previous_item_id,
+            )
+        )
+
+        self._last_item_id = item_id
+
+        # 2. Transcribe
+        try:
+            lang = self.language if self.language else "auto"
+            transcript = await transcribe_audio_array(arr, self.sample_rate, language=lang)
+        except Exception as e:
+            logger.error(f"[RT-TRANSCRIBE] Transcription failed: {e}")
+            await self.ws.send_json(
+                _rt_event(
+                    "transcript.text.done",
+                    item_id=item_id,
+                    content_index=0,
+                    text="",
+                )
+            )
+            self._clear_buffer()
+            return
+
+        if not transcript:
+            self._clear_buffer()
+            return
+
+        # 3. Send delta event (full transcript as one delta for simplicity —
+        #    GLM-ASR doesn't stream tokens, so we send the whole thing)
+        await self.ws.send_json(
+            _rt_event(
+                "transcript.text.delta",
+                item_id=item_id,
+                content_index=0,
+                delta=transcript,
+            )
+        )
+
+        # 4. Send completed event
+        await self.ws.send_json(
+            _rt_event(
+                "transcript.text.done",
+                item_id=item_id,
+                content_index=0,
+                text=transcript,
+            )
+        )
+
+        logger.info(f"[RT] Committed ({reason}): '{transcript[:80]}'")
+        self._clear_buffer()
+
+    async def commit_buffer(self) -> None:
+        """Public API: commit buffer on explicit client request."""
+        await self._commit_buffer(reason="client_commit")
+
+    # ---- session dict for responses ----
+
+    def _session_dict(self) -> dict:
+        td = None
+        if self.turn_detection_type == "server_vad":
+            td = {
+                "type": "server_vad",
+                "threshold": self.vad_threshold,
+                "prefix_padding_ms": self.vad_prefix_padding_ms,
+                "silence_duration_ms": self.vad_silence_duration_ms,
+            }
+        nr = None
+        if self.noise_reduction:
+            nr = {"type": self.noise_reduction}
+        include = []
+        if self.include_logprobs:
+            include.append("item.input_audio_transcription.logprobs")
+        return {
+            "object": "realtime.transcription_session",
+            "type": "transcription",
+            "id": self.session_id,
+            "input_audio_format": self.input_audio_format,
+            "input_audio_transcription": {
+                "model": "glm-nano-2512",
+                "language": self.language or None,
+                "prompt": self.prompt,
+            },
+            "turn_detection": td,
+            "input_audio_noise_reduction": nr,
+            "include": include,
+        }
+
+    # ---- handle client events ----
+
+    async def handle_event(self, event: dict) -> None:
+        """Route a single client-sent JSON event."""
+        evt_type = event.get("type", "")
+
+        if evt_type == "transcription_session.update":
+            await self._handle_session_update(event)
+        elif evt_type == "input_audio_buffer.append":
+            audio_b64 = event.get("audio", "")
+            if audio_b64:
+                await self.append_audio(audio_b64)
+        elif evt_type == "input_audio_buffer.commit":
+            await self.commit_buffer()
+        elif evt_type == "input_audio_buffer.clear":
+            self._clear_buffer()
+            await self.ws.send_json(_rt_event("input_audio_buffer.cleared"))
+        else:
+            logger.warning(f"[RT] Unknown client event type: {evt_type}")
+
+    async def _handle_session_update(self, event: dict) -> None:
+        """Handle transcription_session.update client event."""
+        # Update input format
+        fmt = event.get("input_audio_format")
+        if fmt:
+            self.input_audio_format = fmt
+            if fmt == "pcm16":
+                self.sample_rate = 24000
+            elif fmt == "pcm8":
+                self.sample_rate = 8000
+            # g711 variants would need transcoding — accept but keep 24kHz
+
+        # Update transcription config
+        xcr = event.get("input_audio_transcription")
+        if isinstance(xcr, dict):
+            self.language = xcr.get("language", "")
+            self.prompt = xcr.get("prompt", "")
+
+        # Update turn detection
+        td = event.get("turn_detection")
+        if td is None:
+            self.turn_detection_type = "none"
+        elif isinstance(td, dict):
+            self.turn_detection_type = td.get("type", "server_vad")
+            if "threshold" in td:
+                self.vad_threshold = float(td["threshold"])
+            if "prefix_padding_ms" in td:
+                self.vad_prefix_padding_ms = int(td["prefix_padding_ms"])
+            if "silence_duration_ms" in td:
+                self.vad_silence_duration_ms = int(td["silence_duration_ms"])
+
+        # Update noise reduction
+        nr = event.get("input_audio_noise_reduction")
+        if nr is None:
+            self.noise_reduction = None
+        elif isinstance(nr, dict):
+            self.noise_reduction = nr.get("type")
+
+        # Update include
+        inc = event.get("include")
+        if isinstance(inc, list):
+            self.include_logprobs = "item.input_audio_transcription.logprobs" in inc
+
+        await self.send_updated()
+
+
+@app.websocket("/v1/realtime")
+async def realtime_transcription_ws(
+    websocket: WebSocket,
+    intent: Optional[str] = None,
+):
+    """
+    OpenAI Realtime API compatible transcription WebSocket.
+
+    Query params:
+    - intent: "transcription" (recommended for clarity, but not required)
+
+    Client-sent events (JSON):
+    - transcription_session.update: configure the session
+    - input_audio_buffer.append: send Base64-encoded PCM16 audio
+    - input_audio_buffer.commit: manually commit buffer for transcription
+    - input_audio_buffer.clear: clear the audio buffer
+
+    Server-sent events (JSON):
+    - transcription_session.created / .updated
+    - input_audio_buffer.committed
+    - input_audio_buffer.cleared
+    - transcript.text.delta
+    - transcript.text.done
+    - error
+    """
+    await websocket.accept()
+    logger.info(f"[RT-WS] Client connected (intent={intent})")
+
+    session = RealtimeTranscriptionSession(websocket)
+
+    # Send session.created on connect
+    await session.send_created()
+
+    try:
+        while True:
+            if websocket.client_state != WebSocketState.CONNECTED:
+                break
+
+            raw = await websocket.receive_text()
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                await session.send_error("Invalid JSON")
+                continue
+
+            await session.handle_event(event)
+
+    except WebSocketDisconnect:
+        logger.info("[RT-WS] Client disconnected")
+    except Exception as e:
+        logger.error(f"[RT-WS] Error: {e}", exc_info=True)
+    finally:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close()
+        logger.info("[RT-WS] Connection closed")
 
 
 if __name__ == "__main__":

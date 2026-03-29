@@ -27,7 +27,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest httpx
+          pip install pytest httpx pytest-asyncio
 
       - name: Lint with ruff
         continue-on-error: true
@@ -41,6 +41,11 @@ jobs:
       - name: Test imports
         run: |
           python -c "from server import app, MODEL_ID, PORT, setup_logging, health; print('All imports successful')"
+          python -c "from server import TranscriptionJsonResponse, TranscriptionVerboseJsonResponse, TranscriptionSegment; print('OpenAI parity models import OK')"
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short
 
       - name: Verify Dockerfile syntax
         run: |
