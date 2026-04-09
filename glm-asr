@@ -1,178 +1,89 @@
 #!/bin/bash
 # GLM-ASR Global CLI Wrapper
-# Install this script in your PATH to use glm-asr from anywhere
-
 set -e
 
-# Configuration
 GLM_ASR_PROJECT_DIR="${GLM_ASR_HOME:-$HOME/.glm-asr}"
 GLM_ASR_CONTAINER_NAME="${GLM_ASR_CONTAINER:-glm-asr}"
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Help function
-show_help() {
-    cat << EOF
-GLM-ASR Global CLI - Transcribe audio/video files from anywhere
-
-Usage: glm-asr [command] [options]
-
-Commands:
-  transcribe <file>    Transcribe an audio/video file
-  health               Check server health
-  status               Show container status
-  start                Start the GLM-ASR container
-  stop                 Stop the GLM-ASR container
-  help                 Show this help message
-
-Examples:
-  # Transcribe a file (anywhere on your system)
-  glm-asr transcribe ~/Downloads/podcast.mp3
-  glm-asr transcribe ~/Videos/lecture.mp4 -o ~/Documents/transcript.txt
-
-  # With language
-  glm-asr transcribe audio.wav -l zh
-
-  # To SRT format
-  glm-asr transcribe video.mp4 --format srt
-
-  # Check status
-  glm-asr status
-  glm-asr health
-
-Setup:
-  1. Ensure GLM-ASR is installed: cd /path/to/glm-asr && docker compose up -d
-  2. Add this script to your PATH: export PATH="/path/to/glm-asr:\$PATH"
-  3. Use from anywhere: glm-asr transcribe /any/path/to/audio.mp3
-
-Environment Variables:
-  GLM_ASR_HOME    - GLM-ASR project directory (default: ~/.glm-asr)
-  GLM_ASR_CONTAINER - Container name (default: glm-asr)
-
-For more information, visit: https://github.com/lsj5031/glm-asr-docker
-EOF
-}
-
-# Check if container is running
 check_container() {
     if ! docker ps --format '{{.Names}}' | grep -q "^${GLM_ASR_CONTAINER_NAME}$"; then
-        echo -e "${RED}Error: GLM-ASR container '${GLM_ASR_CONTAINER_NAME}' is not running${NC}"
-        echo -e "${YELLOW}Start it with: glm-asr start${NC}"
-        echo -e "${YELLOW}Or: cd ${GLM_ASR_PROJECT_DIR} && docker compose up -d${NC}"
+        echo -e "${RED}Error: Container '${GLM_ASR_CONTAINER_NAME}' is not running${NC}"
+        echo -e "${YELLOW}Start with: glm-asr start${NC}"
         return 1
     fi
-    return 0
 }
 
-# Copy file to container and transcribe
-transcribe_file() {
-    local input_file="$1"
-    shift
-    local cli_args="$@"
-
-    # Validate input file
-    if [ ! -f "$input_file" ]; then
-        echo -e "${RED}Error: File not found: $input_file${NC}"
-        return 1
-    fi
-
-    # Get file extension and create temp name
-    local filename=$(basename "$input_file")
-    local basename_noext="${filename%.*}"
-    local container_input="/tmp/${filename}"
-    local container_output="/tmp/${basename_noext}.txt"
-
-    echo -e "${GREEN}GLM-ASR Transcription${NC}"
-    echo "Input: $input_file"
-    echo "Size: $(du -h "$input_file" | cut -f1)"
-
-    # Copy file to container
-    echo -e "${YELLOW}Copying file to container...${NC}"
-    docker cp "$input_file" "${GLM_ASR_CONTAINER_NAME}:${container_input}"
-
-    # Transcribe
-    echo -e "${YELLOW}Transcribing...${NC}"
-    docker exec "${GLM_ASR_CONTAINER_NAME}" python glm_asr_cli.py transcribe \
-        "$container_input" \
-        -o "$container_output" \
-        $cli_args
-
-    # Copy result back
-    local output_file="${input_file%.*}.txt"
-    echo -e "${YELLOW}Copying transcript back...${NC}"
-    docker cp "${GLM_ASR_CONTAINER_NAME}:${container_output}" "$output_file"
-
-    # Cleanup
-    docker exec "${GLM_ASR_CONTAINER_NAME}" rm -f "$container_input" "$container_output"
-
-    echo -e "${GREEN}✓ Transcription complete!${NC}"
-    echo "Output: $output_file"
-}
-
-# Main command dispatcher
 case "${1:-}" in
     transcribe)
-        if [ -z "$2" ]; then
-            echo -e "${RED}Error: Please specify a file to transcribe${NC}"
-            echo "Usage: glm-asr transcribe <file> [options]"
-            exit 1
-        fi
+        [ -z "$2" ] && { echo "Usage: glm-asr transcribe <file> [options]"; exit 1; }
         check_container || exit 1
-        transcribe_file "$2" "${@:3}"
+
+        input_file="$2"
+        [ ! -f "$input_file" ] && { echo -e "${RED}Error: File not found: $input_file${NC}"; exit 1; }
+
+        filename=$(basename "$input_file")
+        container_input="/tmp/${filename}"
+        basename_noext="${filename%.*}"
+        container_output="/tmp/${basename_noext}.txt"
+
+        echo -e "${GREEN}GLM-ASR Transcription${NC}"
+        echo "Input: $input_file ($(du -h "$input_file" | cut -f1))"
+
+        docker cp "$input_file" "${GLM_ASR_CONTAINER_NAME}:${container_input}"
+        docker exec "${GLM_ASR_CONTAINER_NAME}" python glm_asr_cli.py transcribe \
+            "$container_input" -o "$container_output" "${@:3}"
+
+        output_file="${input_file%.*}.txt"
+        docker cp "${GLM_ASR_CONTAINER_NAME}:${container_output}" "$output_file"
+        docker exec "${GLM_ASR_CONTAINER_NAME}" rm -f "$container_input" "$container_output"
+
+        echo -e "${GREEN}✓ Done: $output_file${NC}"
         ;;
     health)
         check_container || exit 1
         docker exec "${GLM_ASR_CONTAINER_NAME}" python glm_asr_cli.py health
         ;;
     status)
-        echo "GLM-ASR Container Status:"
         if docker ps --format '{{.Names}}' | grep -q "^${GLM_ASR_CONTAINER_NAME}$"; then
-            echo -e "  ${GREEN}● Running${NC} (${GLM_ASR_CONTAINER_NAME})"
-            echo ""
-            echo "Container details:"
-            docker ps --filter "name=${GLM_ASR_CONTAINER_NAME}" --format "  Name: {{.Names}}\n  Image: {{.Image}}\n  Ports: {{.Ports}}\n  Status: {{.Status}}"
+            echo -e "${GREEN}● Running${NC}"
+            docker ps --filter "name=${GLM_ASR_CONTAINER_NAME}" --format "  Image: {{.Image}}\n  Ports: {{.Ports}}\n  Status: {{.Status}}"
         else
-            echo -e "  ${RED}○ Not running${NC} (${GLM_ASR_CONTAINER_NAME})"
-            echo ""
-            echo "Start with: glm-asr start"
+            echo -e "${RED}○ Not running${NC}"
         fi
         ;;
     start)
-        if [ -d "$GLM_ASR_PROJECT_DIR" ]; then
-            echo "Starting GLM-ASR container..."
-            cd "$GLM_ASR_PROJECT_DIR"
-            docker compose up -d
-            echo "Waiting for service to be healthy..."
-            sleep 5
-            glm-asr health
-        else
-            echo -e "${RED}Error: GLM-ASR project directory not found: $GLM_ASR_PROJECT_DIR${NC}"
-            echo "Please set GLM_ASR_HOME to your GLM-ASR project directory"
-            echo "Example: export GLM_ASR_HOME=/path/to/glm-asr"
-            exit 1
-        fi
+        [ -d "$GLM_ASR_PROJECT_DIR" ] || { echo -e "${RED}Error: Set GLM_ASR_HOME to your project directory${NC}"; exit 1; }
+        cd "$GLM_ASR_PROJECT_DIR" && docker compose up -d
+        sleep 5 && glm-asr health
         ;;
     stop)
-        if [ -d "$GLM_ASR_PROJECT_DIR" ]; then
-            echo "Stopping GLM-ASR container..."
-            cd "$GLM_ASR_PROJECT_DIR"
-            docker compose down
-        else
-            echo -e "${RED}Error: GLM-ASR project directory not found: $GLM_ASR_PROJECT_DIR${NC}"
-            exit 1
-        fi
+        [ -d "$GLM_ASR_PROJECT_DIR" ] || { echo -e "${RED}Error: Set GLM_ASR_HOME to your project directory${NC}"; exit 1; }
+        cd "$GLM_ASR_PROJECT_DIR" && docker compose down
         ;;
     help|--help|-h)
-        show_help
+        cat << 'EOF'
+Usage: glm-asr <command> [options]
+
+Commands:
+  transcribe <file>  Transcribe audio/video file
+  health             Check server health
+  status             Show container status
+  start              Start the container
+  stop               Stop the container
+
+Examples:
+  glm-asr transcribe audio.mp3
+  glm-asr transcribe audio.mp3 -l zh --format srt
+EOF
         ;;
     *)
-        echo -e "${RED}Error: Unknown command '${1:-}'${NC}"
-        echo ""
-        show_help
+        echo -e "${RED}Unknown command '${1:-}'${NC}"
+        echo "Run: glm-asr help"
         exit 1
         ;;
 esac

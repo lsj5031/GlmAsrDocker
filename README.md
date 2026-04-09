@@ -187,21 +187,16 @@ docker compose exec glm-asr python glm_asr_cli.py --help
 | `--output` | `-o` | Output transcript path | Auto-generated |
 | `--server-url` | `-s` | Server URL | http://localhost:8000 |
 | `--language` | `-l` | Language code (ISO 639-1) | auto |
-| `--chunk-minutes` | `-c` | Chunk duration (minutes) | 5 |
-| `--format` | `-f` | Output format (text/srt) | text |
+| `--format` | `-f` | Output format (text/srt/json/verbose_json) | text |
 
-### Wrapper Script
+### Global CLI Wrapper
 
-For convenience outside the container:
+Use `glm-asr` from anywhere on your system:
 
 ```bash
-# Make script executable (first time only)
-chmod +x glm-asr.sh
-
-# Use the wrapper
-./glm-asr.sh transcribe data/audio.mp3
-./glm-asr.sh transcribe data/video.mp4 -o data/output.txt
-./glm-asr.sh health
+glm-asr transcribe ~/Downloads/audio.mp3
+glm-asr transcribe video.mp4 -l zh --format srt
+glm-asr health
 ```
 
 ## 🎬 Supported Formats

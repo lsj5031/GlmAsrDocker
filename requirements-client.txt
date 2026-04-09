@@ -1,5 +1,3 @@
 # Client Dependencies for client_example.py
 
 httpx
-pydub
-tqdm

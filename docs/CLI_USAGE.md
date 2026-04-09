@@ -27,8 +27,8 @@
    # Method 2: Using docker compose exec
    docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/your-audio.mp3
 
-   # Method 3: Using wrapper script
-   ./glm-asr.sh transcribe data/your-audio.mp3
+   # Method 3: Using global CLI wrapper
+   glm-asr transcribe data/your-audio.mp3
    ```
 
 ## Supported Audio Formats
@@ -68,9 +68,6 @@ make transcribe INPUT=/app/data/input.mp3 FORMAT=srt
 ```bash
 # Process all files in directory
 docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/
-
-# With custom chunk size for long files
-docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/ -c 10
 ```
 
 ### Server Management
@@ -97,8 +94,7 @@ make clean
 | `--output` | `-o` | Output file path | Auto-generated |
 | `--server-url` | `-s` | Server URL | http://localhost:8000 |
 | `--language` | `-l` | Language code | auto |
-| `--chunk-minutes` | `-c` | Chunk duration (minutes) | 5 |
-| `--format` | `-f` | Output format (text/srt) | text |
+| `--format` | `-f` | Output format (text/srt/json/verbose_json) | text |
 
 ## File Locations
 

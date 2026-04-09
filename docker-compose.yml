@@ -23,6 +23,7 @@ services:
       - CHUNK_OVERLAP_MS=1000
       - VAD_THRESHOLD=0.6
       - VAD_MIN_SILENCE_MS=300
+      - HF_HUB_OFFLINE=1
     deploy:
       resources:
         reservations:

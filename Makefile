@@ -54,7 +54,7 @@ clean:
 
 # CLI commands
 transcribe:
-	docker compose exec glm-asr python glm_asr_cli.py transcribe $(INPUT) $(if $(OUTPUT),-o $(OUTPUT),) $(if $(LANGUAGE),-l $(LANGUAGE),) $(if $(FORMAT),-f $(FORMAT),) $(if $(CHUNK_MINUTES),-c $(CHUNK_MINUTES),)
+	docker compose exec glm-asr python glm_asr_cli.py transcribe $(INPUT) $(if $(OUTPUT),-o $(OUTPUT),) $(if $(LANGUAGE),-l $(LANGUAGE),) $(if $(FORMAT),-f $(FORMAT),)
 
 cli:
 	docker compose exec glm-asr python glm_asr_cli.py --help
